@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Node.js 22 or newer is required: Node.js 20 reached end of life in April 2026.
+- CI runs on Node.js 22 and 24 with `actions/checkout` and `actions/setup-node` v7.
+
 ## [0.1.0] - 2026-11-11
 
 First release.

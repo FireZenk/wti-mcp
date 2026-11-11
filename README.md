@@ -44,7 +44,7 @@ Write tools aren't registered in read-only mode. Delete tools are only registere
 
 ## Setup
 
-Requires Node.js 20 or newer.
+Requires Node.js 22 or newer.
 
 ```bash
 git clone https://github.com/FireZenk/wti-mcp.git
