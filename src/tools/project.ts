@@ -1,12 +1,54 @@
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { compareLines, type NumberedLine } from "../diff.js";
 import { compactProject, compactStats } from "../format.js";
 import { ASYNC_NOTE, DELETE, OVERWRITE, READ_ONLY, WRITE, checkLocales, id, locale, run, type ToolContext } from "./common.js";
 
 const DATE_RANGE = /^\d+\.(day|week|month|year)s?\.ago$/;
 const DEFAULT_MAX_CHARS = 30_000;
+/** Lines listed per side in an upload preview; the counts are always complete. */
+const MAX_PREVIEW_LINES = 40;
+
+/**
+ * Ties a confirmation to what the preview compared: the token changes as soon as the local file or
+ * WebTranslateIt's copy does, so an upload can't go through on a stale preview.
+ */
+function previewToken(fileId: number, locale: string, remote: string, local: Buffer): string {
+  return createHash("sha256")
+    .update(`${fileId}\0${locale}\0`)
+    .update(remote)
+    .update("\0")
+    .update(local)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function listLines(lines: NumberedLine[]) {
+  return {
+    count: lines.length,
+    lines: lines.slice(0, MAX_PREVIEW_LINES).map((entry) => `${entry.line}: ${entry.text.slice(0, 200)}`),
+    ...(lines.length > MAX_PREVIEW_LINES ? { more: lines.length - MAX_PREVIEW_LINES } : {}),
+  };
+}
+
+function uploadEffects(isMasterFile: boolean, merge: boolean, ignoreMissing: boolean): string[] {
+  const effects = [
+    merge
+      ? "Strings whose text differs keep WebTranslateIt's text (merge: true); only strings it doesn't have are added."
+      : "Strings whose text differs get your file's text, replacing what is on WebTranslateIt (merge: false).",
+  ];
+  if (!isMasterFile) {
+    effects.push("Translations of strings that aren't in your file aren't touched.");
+  } else if (ignoreMissing) {
+    effects.push("Strings that are only on WebTranslateIt stay as they are (ignore_missing: true).");
+  } else {
+    effects.push("Strings that are only on WebTranslateIt are marked obsolete (ignore_missing: false).");
+  }
+  return effects;
+}
 
 export function registerProjectTools(server: McpServer, { client, readOnly, allowDelete }: ToolContext): void {
   server.registerTool(
@@ -108,8 +150,11 @@ export function registerProjectTools(server: McpServer, { client, readOnly, allo
     {
       title: "Upload a language file",
       description:
-        "Upload a local language file to a file and locale on WebTranslateIt, like `wti push` does for one file. The " +
-        "import runs in the background. By default strings missing from the upload are kept (ignore_missing: true).",
+        "Upload a local language file to a file and locale on WebTranslateIt, like `wti push` does for one file. " +
+        "Called without `confirm`, it uploads nothing: it downloads WebTranslateIt's current copy and returns the " +
+        "lines that are only there (changes by other people that the upload could overwrite) and the lines that are " +
+        "only in your file. Show them to the user, then call again with the `confirm` token to upload. The import " +
+        "runs in the background. By default strings missing from the upload are kept (ignore_missing: true).",
       inputSchema: {
         file_id: id("Master file id from wti_get_project."),
         locale: locale().describe("Locale of the uploaded file. Use the source locale to update the master file."),
@@ -130,6 +175,13 @@ export function registerProjectTools(server: McpServer, { client, readOnly, allo
           .optional()
           .describe("Master file only: don't flag the target translations as 'to verify'."),
         label: z.string().optional().describe("Label applied to every string this upload changes."),
+        confirm: z
+          .string()
+          .optional()
+          .describe(
+            "The `confirm` token from this tool's preview. It only works while your file and WebTranslateIt's copy " +
+              "are the ones the preview compared; if either changed, you get a new preview instead of an upload.",
+          ),
       },
       annotations: OVERWRITE,
     },
@@ -138,14 +190,72 @@ export function registerProjectTools(server: McpServer, { client, readOnly, allo
         await checkLocales(client, [args.locale]);
         const path = resolve(args.local_path);
         const content = await readFile(path);
+        const merge = args.merge ?? false;
+        const ignoreMissing = args.ignore_missing ?? true;
+
+        // The "pull before push": compare with what is on WebTranslateIt right now.
+        const remote = await client.downloadFile(args.file_id, args.locale);
+        const token = previewToken(args.file_id, args.locale, remote, content);
+
+        if (args.confirm !== token) {
+          const { onlyBefore, onlyAfter } = compareLines(remote, content.toString("utf8"));
+          const target = { file_id: args.file_id, locale: args.locale, local_path: path };
+          if (onlyBefore.length === 0 && onlyAfter.length === 0) {
+            return {
+              status: "unchanged",
+              uploaded: false,
+              ...target,
+              note:
+                "Your file has the same lines as WebTranslateIt's copy (ignoring order, indentation and blank lines), " +
+                "so there is nothing to upload. Pass confirm to upload it anyway.",
+              confirm: token,
+            };
+          }
+          const project = await client.getProject();
+          const notes: string[] = [];
+          if (args.confirm) {
+            notes.push(
+              "Not uploaded: your file or WebTranslateIt's copy changed since that preview, so its token no longer " +
+                "matches. These are the current differences.",
+            );
+          }
+          if (onlyAfter.length === 0) {
+            notes.push(
+              "Your file has no lines that aren't on WebTranslateIt, so uploading it would add nothing: it is behind " +
+                "WebTranslateIt's copy. Use wti_download_file to get the lines listed under only_on_webtranslateit.",
+            );
+          }
+          return {
+            status: "preview",
+            uploaded: false,
+            ...target,
+            ...(notes.length ? { note: notes.join(" ") } : {}),
+            only_on_webtranslateit: listLines(onlyBefore),
+            only_in_your_file: listLines(onlyAfter),
+            if_you_upload: uploadEffects(args.locale === project.source_locale?.code, merge, ignoreMissing),
+            confirm: token,
+            next_step:
+              "Show these differences to the user. To upload, call wti_upload_file again with the same arguments " +
+              `and confirm: "${token}".`,
+          };
+        }
+
         const form = new FormData();
-        form.append("merge", String(args.merge ?? false));
-        form.append("ignore_missing", String(args.ignore_missing ?? true));
+        form.append("merge", String(merge));
+        form.append("ignore_missing", String(ignoreMissing));
         form.append("minor_changes", String(args.minor_changes ?? false));
         if (args.label) form.append("label", args.label);
         form.append("file", new Blob([content]), basename(path));
         await client.uploadFile(args.file_id, args.locale, form);
-        return { uploaded: path, bytes: content.byteLength, file_id: args.file_id, locale: args.locale, note: ASYNC_NOTE };
+        return {
+          status: "uploaded",
+          uploaded: true,
+          file_id: args.file_id,
+          locale: args.locale,
+          local_path: path,
+          bytes: content.byteLength,
+          note: ASYNC_NOTE,
+        };
       }),
   );
 

@@ -35,7 +35,7 @@ It talks to the WebTranslateIt REST API the same way `wti` 3.x does: a Bearer to
 | `wti_create_string` | Create a key with its source text, translations, comment and labels | write |
 | `wti_update_string` | Rename a key, change its comment, labels (add/remove) or status | write |
 | `wti_set_translations` | Save a string's translation in one or more locales | write |
-| `wti_upload_file` | Upload a local language file (one-file `wti push`) | write |
+| `wti_upload_file` | Compare a local language file with WebTranslateIt's copy, then upload it (one-file `wti push`) | write |
 | `wti_add_locale` | Add a target locale | write |
 | `wti_create_term`, `wti_update_term`, `wti_set_term_translation` | Edit the glossary | write |
 | `wti_delete_string`, `wti_delete_term`, `wti_remove_locale` | Delete things | delete |
@@ -107,8 +107,17 @@ Add `-e WTI_READ_ONLY=true` for a read-only setup. Each server instance works on
   same key exists in several files. The API's key filter matches prefixes, so the server picks the exact match.
 - **Writes are asynchronous.** WebTranslateIt answers 202 Accepted and applies changes in the background; re-read
   after a few seconds before relying on them.
+- **`wti_upload_file` checks WebTranslateIt before uploading.** Neither `wti push` nor the API looks at what
+  changed on WebTranslateIt since your last pull. Called without `confirm`, the tool uploads nothing: it downloads
+  the current copy and lists the lines that are only there (someone else's changes, which the upload could
+  overwrite) and the lines only in your file. The upload happens on a second call with the `confirm` token from
+  that preview. The token is tied to both files' content, so if either changes in between you get a new preview
+  instead of an upload. The comparison ignores line order, indentation and blank lines; it works best on files
+  that came from a `wti pull`, since WebTranslateIt's export formatting may differ from a hand-written file.
 - **`wti_upload_file` keeps missing strings by default** (`ignore_missing: true`), unlike the API, so uploading a
   partial file can't mark the rest of the project obsolete. Pass `ignore_missing: false` to sync deletions.
+  With `merge: false` (the default) your file's text replaces WebTranslateIt's where they differ; with
+  `merge: true` WebTranslateIt keeps its text and only adds what it doesn't have.
 - **Statuses.** Translations: `status_unproofread`, `status_proofread`, `status_unverified`. Strings: `current`,
   `hidden`, `obsolete`. In stats, `done` only counts proofread strings; `percent_translated` also counts the ones
   waiting for proofreading.
