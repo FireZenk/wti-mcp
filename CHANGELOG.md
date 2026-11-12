@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `wti_upload_file` no longer uploads straight away. It first downloads WebTranslateIt's copy of the file and
+  returns the lines only there and the lines only in your file, with what the upload would do to them; it
+  uploads when called again with the `confirm` token from that preview. A token from before either file
+  changed gives a new preview instead of an upload.
 - Node.js 22 or newer is required: Node.js 20 reached end of life in April 2026.
 - CI runs on Node.js 22 and 24 with `actions/checkout` and `actions/setup-node` v7.
 

@@ -215,19 +215,90 @@ describe("strings", () => {
 });
 
 describe("files", () => {
-  it("wti_upload_file keeps missing strings unless told otherwise", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "wti-mcp-"));
-    const path = join(dir, "strings.xml");
-    writeFileSync(path, '<resources><string name="a">A</string></resources>');
-    const fake = fakeWti().on("PUT", "/api/projects/current/files/10/locales/en", { status: 202 });
-    const result = await call(await connect(fake), "wti_upload_file", { file_id: 10, locale: "en", local_path: path, label: "android" });
+  const FILE_EN = "/api/projects/current/files/10/locales/en";
+  const FILE_DE = "/api/projects/current/files/10/locales/de";
 
-    expect(result.isError).toBe(false);
-    const form = fake.find("PUT", "/api/projects/current/files/10/locales/en")[0]?.form;
+  function localFile(content: string): string {
+    const path = join(mkdtempSync(join(tmpdir(), "wti-mcp-")), "strings.xml");
+    writeFileSync(path, content);
+    return path;
+  }
+
+  const xml = (...lines: string[]) => ["<resources>", ...lines.map((line) => `    ${line}`), "</resources>"].join("\n");
+
+  it("wti_upload_file first shows what differs from WebTranslateIt's copy and uploads nothing", async () => {
+    // Someone changed "b" and added "c" on WebTranslateIt; locally "b" was edited and "d" added.
+    const remote = xml('<string name="a">A</string>', '<string name="b">Theirs</string>', '<string name="c">C</string>');
+    const path = localFile(xml('<string name="a">A</string>', '<string name="b">Mine</string>', '<string name="d">D</string>'));
+    const fake = fakeWti().on("GET", FILE_EN, { text: remote }).on("PUT", FILE_EN, { status: 202 });
+    const result = (await call(await connect(fake), "wti_upload_file", { file_id: 10, locale: "en", local_path: path })).json();
+
+    expect(result).toMatchObject({
+      status: "preview",
+      uploaded: false,
+      only_on_webtranslateit: { count: 2, lines: ['3: <string name="b">Theirs</string>', '4: <string name="c">C</string>'] },
+      only_in_your_file: { count: 2, lines: ['3: <string name="b">Mine</string>', '4: <string name="d">D</string>'] },
+    });
+    expect(result.if_you_upload.join(" ")).toMatch(/replacing what is on WebTranslateIt.*only on WebTranslateIt stay/);
+    expect(result.confirm).toMatch(/^[0-9a-f]{16}$/);
+    expect(fake.find("PUT", FILE_EN)).toHaveLength(0);
+  });
+
+  it("wti_upload_file uploads with the preview's token, keeping missing strings by default", async () => {
+    const path = localFile(xml('<string name="a">A</string>', '<string name="d">D</string>'));
+    const fake = fakeWti().on("GET", FILE_EN, { text: xml('<string name="a">A</string>') }).on("PUT", FILE_EN, { status: 202 });
+    const client = await connect(fake);
+    const args = { file_id: 10, locale: "en", local_path: path, label: "android" };
+
+    const preview = (await call(client, "wti_upload_file", args)).json();
+    const result = (await call(client, "wti_upload_file", { ...args, confirm: preview.confirm })).json();
+
+    expect(result).toMatchObject({ status: "uploaded", uploaded: true, bytes: Buffer.byteLength(xml('<string name="a">A</string>', '<string name="d">D</string>')) });
+    const form = fake.find("PUT", FILE_EN)[0]?.form;
     expect(form?.get("ignore_missing")).toBe("true");
     expect(form?.get("merge")).toBe("false");
     expect(form?.get("label")).toBe("android");
     expect((form?.get("file") as File).name).toBe("strings.xml");
+  });
+
+  it("wti_upload_file refuses a token from before someone else changed WebTranslateIt's copy", async () => {
+    let remote = xml('<string name="a">A</string>');
+    const path = localFile(xml('<string name="a">A</string>', '<string name="d">D</string>'));
+    const fake = fakeWti().on("GET", FILE_DE, () => ({ text: remote })).on("PUT", FILE_DE, { status: 202 });
+    const client = await connect(fake);
+    const args = { file_id: 10, locale: "de", local_path: path };
+
+    const first = (await call(client, "wti_upload_file", args)).json();
+    remote = xml('<string name="a">A</string>', '<string name="e">Added meanwhile</string>');
+    const second = (await call(client, "wti_upload_file", { ...args, confirm: first.confirm })).json();
+
+    expect(second.status).toBe("preview");
+    expect(second.note).toMatch(/changed since that preview/);
+    expect(second.only_on_webtranslateit.lines).toEqual(['3: <string name="e">Added meanwhile</string>']);
+    expect(second.if_you_upload.join(" ")).toMatch(/aren't in your file aren't touched/);
+    expect(second.confirm).not.toBe(first.confirm);
+    expect(fake.find("PUT", FILE_DE)).toHaveLength(0);
+  });
+
+  it("wti_upload_file says when the local file is only behind WebTranslateIt's copy", async () => {
+    const remote = xml('<string name="a">A</string>', '<string name="b">Neu</string>');
+    const path = localFile(xml('<string name="a">A</string>'));
+    const fake = fakeWti().on("GET", FILE_DE, { text: remote }).on("PUT", FILE_DE, { status: 202 });
+    const result = (await call(await connect(fake), "wti_upload_file", { file_id: 10, locale: "de", local_path: path })).json();
+
+    expect(result).toMatchObject({ status: "preview", uploaded: false, only_in_your_file: { count: 0 } });
+    expect(result.note).toMatch(/behind WebTranslateIt's copy\. Use wti_download_file/);
+    expect(fake.find("PUT", FILE_DE)).toHaveLength(0);
+  });
+
+  it("wti_upload_file says there's nothing to upload when only order and indentation differ", async () => {
+    const remote = xml('<string name="a">A</string>', '<string name="b">B</string>');
+    const path = localFile('<resources>\n<string name="b">B</string>\n\n  <string name="a">A</string>\n</resources>\n');
+    const fake = fakeWti().on("GET", FILE_EN, { text: remote }).on("PUT", FILE_EN, { status: 202 });
+    const result = (await call(await connect(fake), "wti_upload_file", { file_id: 10, locale: "en", local_path: path })).json();
+
+    expect(result).toMatchObject({ status: "unchanged", uploaded: false });
+    expect(fake.find("PUT", FILE_EN)).toHaveLength(0);
   });
 
   it("wti_download_file cuts long content unless saved to disk", async () => {
